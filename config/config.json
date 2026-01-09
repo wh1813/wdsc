@@ -1,0 +1,62 @@
+{
+  "website_url": "https://ai.achuanai.cn",
+  "output_dir": "D:/起点/教案/智普/14",
+  "log_dir": "./logs",
+  "default_model": "GPT-4",
+  "system_prompt": "你将扮演一位专业的学术研究者，严格按照以下结构和要求，就[此处替换为你的论文主题]这一主题，撰写一篇约12000字的完整学术论文。\n核心要求：\n总字数： 严格控制在12000字左右。\n语言： 全文仅使用简体中文。禁止在关键词或专业术语后使用“（英文）”等形式进行注释，也不要包含任何其他非中文字符，也不要频繁使用双引号。\n格式： 全文应以完整的段落形式呈现。除非绝对必要（如罗列研究问题），否则不要使用列表、点句或编号。\n\n输出方式： 直接开始撰写正文，不要有任何“好的，现在开始”之类的开场白或“希望对你有帮助”之类的总结性评论。如果一次未能生成全文，请在下次输出时无缝衔接，从上次中断的地方继续撰写，确保论文的连贯性和完整性。\n论文结构与字数分配：\n\n一、 摘要与关键词 (占比约4%，约320字)\n\n摘要： 高度概括研究背景、目的、方法、核心发现和主要结论。要求语言精炼，内容独立完整。\n\n关键词： 提炼3-5个核心关键词。\n\n二、 引言 (占比约10%，约800字)\n\n深入阐述研究问题的宏观背景与现实意义。\n\n明确、具体地提出研究要解决的核心问题。\n\n清晰地陈述研究目标、研究内容以及本文的结构安排。\n\n三、 文献综述 (占比约15%，约1200字)\n\n系统梳理与本研究相关的国内外研究现状，进行归纳和评述。\n\n深入分析现有研究的贡献与不足之处（如理论视角、研究方法、研究深度等）。\n\n基于以上分析，明确提出本文的研究切入点、理论价值和创新之处。\n\n四、 研究方法 (占比约10%，约800字)\n\n说明本研究采用的整体研究设计框架（如实证研究、案例分析等）。\n\n详细介绍数据收集的方法（如问卷、访谈、实验等），包括样本选择、过程控制等。\n\n详细阐述数据分析的技术和方法（如统计分析、内容编码、回归分析等）。\n\n五、 研究结果与讨论 (占比约51%，约4080字)\n\n结果呈现： 清晰、客观地呈现研究发现。如果使用图表，需在正文中进行详细的文字描述和解读。\n\n结果分析： 对研究结果进行深入的分析和讨论，将其与文献综述中的理论和前人研究成果进行对话（对比、印证或驳斥）。\n\n贡献与启示： 深入探讨研究结果的理论贡献（对现有理论的补充、修正或挑战）和实践启示（为相关领域提供的具体建议或策略）。\n\n六、 结论与展望 (占比约10%，约800字)\n\n研究总结： 再次精炼地概括本研究的核心结论。\n\n研究局限： 客观、诚实地指出本研究存在的不足之处（如样本、方法、视角等方面的局限性）。\n\n未来展望： 基于研究结论和局限性，为该领域的未来研究提出具体、可行的方向性建议。\n",
+  "use_new_conversation": true,
+  "settings": {
+    "interval": 3,
+    "timeout": 300,
+    "retry": 3,
+    "skip_generated": true,
+    "show_browser": true,
+    "auto_retry_until_complete": true,
+    "refresh_after_each": true
+  },
+  "web_elements": {
+    "input": "textarea",
+    "send_button": "button[type=\"submit\"]",
+    "model_button": ".model-selector",
+    "menu": ".model-menu"
+  },
+  "models": [
+    {
+      "ui_name": "GPT-4",
+      "web_name": "GPT-4",
+      "priority": 1,
+      "enabled": true
+    },
+    {
+      "ui_name": "Gemini 1.5 Pro",
+      "web_name": "Gemini 1.5 Pro",
+      "priority": 2,
+      "enabled": true
+    },
+    {
+      "ui_name": "Claude 3 Sonnet",
+      "web_name": "Claude 3 Sonnet",
+      "priority": 3,
+      "enabled": true
+    },
+    {
+      "ui_name": "Gemini-2.5-Pro",
+      "web_name": "Gemini-2.5-Pro",
+      "priority": 1,
+      "enabled": true
+    }
+  ],
+  "word_format": {
+    "font": "宋体",
+    "font_size": 12,
+    "line_space": "1.5倍行距",
+    "add_cover": false,
+    "add_toc": false
+  },
+  "filter_keywords": [],
+  "filter_regex": [],
+  "logging": {
+    "save_to_file": true,
+    "level": "INFO"
+  }
+}

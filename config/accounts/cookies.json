@@ -1,0 +1,20 @@
+[
+  {
+    "name": "sessionid",
+    "value": "test_session_value",
+    "domain": ".achuanai.cn",
+    "path": "/",
+    "expires": -1,
+    "httpOnly": true,
+    "secure": true
+  },
+  {
+    "name": "csrftoken",
+    "value": "test_csrf_value",
+    "domain": ".achuanai.cn",
+    "path": "/",
+    "expires": -1,
+    "httpOnly": false,
+    "secure": true
+  }
+]
