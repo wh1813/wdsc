@@ -1,43 +1,50 @@
-# 使用 Python 3.10 基础镜像
+# 基础镜像
 FROM python:3.10-slim
 
-# 设置环境变量，避免 Python 生成 .pyc 文件，并设置屏幕参数
+# 设置环境变量
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     DISPLAY=:1 \
-    QT_QPA_PLATFORM=xcb
+    SCREEN_RESOLUTION=1280x800x24 \
+    QT_QPA_PLATFORM=xcb \
+    # 关键：设置语言为中文，避免生成的 Word 或 GUI 乱码
+    LANG=C.UTF-8
 
-# 1. 更换国内源（Claw Cloud 在国内访问快）并安装系统依赖
-# xvfb: 虚拟屏幕, x11vnc: 远程桌面服务, fluxbox: 轻量级窗口管理器
+# 1. 更换国内源并安装系统依赖
+# 新增 xclip (剪贴板支持), fonts-noto-cjk (中文字体), libxcb* (PyQt5依赖)
 RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list && \
     apt-get update && apt-get install -y --no-install-recommends \
     xvfb x11vnc fluxbox novnc net-tools \
-    libgl1-mesa-glx libegl1-mesa libxkbcommon-x11-0 \
-    libdbus-1-3 fontconfig ttf-wqy-zenhei \
+    libgl1-mesa-glx libegl1-mesa libxkbcommon-x11-0 libdbus-1-3 \
+    libxcb-cursor0 libxcb-xinerama0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+    xclip fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. 设置工作目录
 WORKDIR /app
 
-# 3. 复制依赖并安装
+# 3. 复制依赖配置
 COPY requirements.txt .
-# 升级 pip 并安装 Python 依赖
+
+# 4. 安装 Python 依赖
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple --upgrade pip && \
     pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt && \
     pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple websockify
 
-# 4. 安装 Playwright 的浏览器（Chromium）
+# 5. 安装 Playwright 浏览器
 RUN playwright install chromium && playwright install-deps chromium
 
-# 5. 复制所有代码到容器
+# 6. 复制所有代码
 COPY . .
 
-# 6. 复制启动脚本并赋予权限
-COPY start.sh .
+# 7. 赋予脚本执行权限
 RUN chmod +x start.sh
 
-# 7. 暴露 VNC 网页版端口
+# 8. 创建关键数据目录 (对应你的代码路径)
+RUN mkdir -p /app/output /app/data /app/logs
+
+# 9. 暴露 Web 访问端口
 EXPOSE 8080
 
-# 8. 启动命令
+# 10. 启动
 CMD ["./start.sh"]
