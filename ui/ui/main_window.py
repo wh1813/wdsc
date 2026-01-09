@@ -1,0 +1,1720 @@
+import sys
+import json
+import asyncio
+import os
+import re
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Optional, Dict, List, Any
+
+from PyQt5.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QTextEdit, QPushButton, QLabel, QProgressBar,
+    QTabWidget, QGroupBox, QComboBox, QSpinBox,
+    QCheckBox, QListWidget, QMessageBox, QFileDialog,
+    QDialog, QTableWidget, QTableWidgetItem, QLineEdit,
+    QScrollArea, QInputDialog, QApplication, QTextCursor
+)
+from PyQt5.QtCore import QThread, pyqtSignal, Qt
+from PyQt5.QtGui import QIcon
+
+from core.task_manager import TaskManager
+from core.storage_manager import StorageManager
+
+
+class ManualLoginThread(QThread):
+    def __init__(self, website_url):
+        super().__init__()
+        self.website_url = website_url
+        self.cookies = []
+        self.local_storage = []
+        self.session_storage = []
+        self.confirmed = False
+        self.browser = None
+        self.context = None
+        self.page = None
+        self.playwright = None
+
+    def run(self):
+        """运行线程"""
+        try:
+            result = asyncio.run(self.manual_login_async())
+
+            if result.get('success'):
+                self.finished.emit(
+                    True,
+                    result.get('message', '登录成功'),
+                    result.get('cookies', [])
+                )
+            else:
+                self.finished.emit(
+                    False,
+                    result.get('message', '登录失败'),
+                    []
+                )
+        except Exception as e:
+            import traceback
+            error_msg = f"登录异常: {str(e)}\n{traceback.format_exc()}"
+            self.error.emit(error_msg)
+            self.finished.emit(False, error_msg, [])
+
+    async def manual_login_async(self):
+        """异步手动登录（保持会话模式）"""
+        from playwright.async_api import async_playwright
+
+        try:
+            self.playwright = await async_playwright().start()
+
+            self.browser = await self.playwright.chromium.launch(
+                headless=False,
+                args=[
+                    '--no-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-blink-features=AutomationControlled'
+                ]
+            )
+
+            self.context = await self.browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            )
+
+            self.page = await self.context.new_page()
+
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    print(f"正在访问网站（尝试 {attempt + 1}/{max_retries}）...")
+                    await self.page.goto(
+                        self.website_url,
+                        timeout=60000,
+                        wait_until='domcontentloaded'
+                    )
+                    print(f"✓ 已访问: {self.website_url}")
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        print(f"访问失败，重试中... ({e})")
+                        await asyncio.sleep(2)
+                    else:
+                        raise Exception(f"访问网站失败（已重试{max_retries}次）: {str(e)}")
+
+            self.ready.emit()
+
+            max_wait_time = 300
+            wait_interval = 0.5
+            waited = 0
+
+            while waited < max_wait_time:
+                if self.confirmed:
+                    break
+                await asyncio.sleep(wait_interval)
+                waited += wait_interval
+
+            if not self.confirmed:
+                return {
+                    'success': False,
+                    'message': "⏰ 登录超时（5分钟）"
+                }
+
+            print("用户已确认登录")
+
+            current_url = self.page.url
+            if 'login' in current_url.lower() or 'signin' in current_url.lower():
+                return {
+                    'success': False,
+                    'message': "似乎还未登录，请重试"
+                }
+
+            print("✓ 保持浏览器会话打开")
+
+            return {
+                'success': True,
+                'message': "✓ 登录成功！\n浏览器会话已保持打开",
+                'cookies': [],
+                'localStorage': [],
+                'sessionStorage': [],
+                'keep_session': True
+            }
+
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            print(f"登录出错:\n{error_details}")
+
+            return {
+                'success': False,
+                'message': f"登录失败: {str(e)}"
+            }
+
+    def confirm_login(self):
+        """确认登录"""
+        self.confirmed = True
+
+
+class TaskThread(QThread):
+    """任务执行线程"""
+
+    log_signal = pyqtSignal(str, str)
+    progress_signal = pyqtSignal(int, int, dict)
+    finished_signal = pyqtSignal(dict)
+
+    def __init__(self, config, storage_manager, titles, model_name, output_dir, active_page=None):
+        super().__init__()
+        self.config = config
+        self.storage_manager = storage_manager
+        self.titles = titles
+        self.model_name = model_name
+        self.output_dir = output_dir
+        self.task_manager = None
+        self.active_page = active_page
+
+    def run(self):
+        """运行线程"""
+        try:
+            result = asyncio.run(self.run_task())
+            self.finished_signal.emit(result)
+        except Exception as e:
+            import traceback
+            error_msg = traceback.format_exc()
+            self.log_signal.emit("ERROR", error_msg)
+            self.finished_signal.emit({'success': False, 'error': str(e)})
+
+    async def run_task(self):
+        """异步执行任务（使用活动会话）"""
+        try:
+            self.task_manager = TaskManager(
+                config=self.config,
+                cookie_manager=self.storage_manager,
+                log_callback=self.log_signal.emit
+            )
+
+            if self.active_page:
+                self.log_signal.emit("INFO", "使用活动浏览器会话")
+                self.task_manager.page = self.active_page
+                self.task_manager.context = self.active_page.context
+                self.task_manager.browser = self.active_page.context.browser
+
+                result = await self.task_manager.process_batch(
+                    titles=self.titles,
+                    model_name=self.model_name,
+                    output_dir=self.output_dir,
+                    progress_callback=lambda c, t, r: self.progress_signal.emit(c, t, r)
+                )
+            else:
+                self.log_signal.emit("INFO", "使用Cookie模式初始化")
+
+                current_account = self.storage_manager.current_account
+                if not current_account:
+                    accounts = self.storage_manager.list_accounts()
+                    if accounts:
+                        current_account = accounts[0]
+                    else:
+                        return {'success': False, 'error': '没有可用的账号'}
+
+                init_success = await self.task_manager.initialize(current_account)
+                if not init_success:
+                    return {'success': False, 'error': '初始化失败'}
+
+                result = await self.task_manager.process_batch(
+                    titles=self.titles,
+                    model_name=self.model_name,
+                    output_dir=self.output_dir,
+                    progress_callback=lambda c, t, r: self.progress_signal.emit(c, t, r)
+                )
+
+            if not self.active_page:
+                await self.task_manager.cleanup()
+
+            return result
+
+        except Exception as e:
+            import traceback
+            self.log_signal.emit("ERROR", traceback.format_exc())
+            return {'success': False, 'error': str(e)}
+
+
+class ModelManagerDialog(QDialog):
+    """模型管理对话框"""
+
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.models = config.get('models', []).copy()
+        self.init_ui()
+
+    def init_ui(self):
+        """初始化UI"""
+        self.setWindowTitle("模型管理")
+        self.setGeometry(200, 200, 800, 500)
+
+        layout = QVBoxLayout(self)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(['UI显示名称', 'Web内部名称', '优先级', '启用'])
+        self.table.horizontalHeader().setStretchLastSection(True)
+
+        layout.addWidget(self.table)
+
+        self.load_models()
+
+        btn_layout = QHBoxLayout()
+
+        add_btn = QPushButton("添加")
+        add_btn.clicked.connect(self.add_model)
+        btn_layout.addWidget(add_btn)
+
+        delete_btn = QPushButton("删除")
+        delete_btn.clicked.connect(self.delete_model)
+        btn_layout.addWidget(delete_btn)
+
+        btn_layout.addStretch()
+
+        save_btn = QPushButton("保存")
+        save_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(save_btn)
+
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        layout.addLayout(btn_layout)
+
+    def load_models(self):
+        """加载模型列表"""
+        self.table.setRowCount(len(self.models))
+
+        for i, model in enumerate(self.models):
+            self.table.setItem(i, 0, QTableWidgetItem(model.get('ui_name', '')))
+            self.table.setItem(i, 1, QTableWidgetItem(model.get('web_name', '')))
+            self.table.setItem(i, 2, QTableWidgetItem(str(model.get('priority', 1))))
+
+            enabled_check = QCheckBox()
+            enabled_check.setChecked(model.get('enabled', True))
+            self.table.setCellWidget(i, 3, enabled_check)
+
+    def add_model(self):
+        """添加模型"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("添加模型")
+        dialog.setGeometry(300, 300, 400, 200)
+
+        layout = QVBoxLayout(dialog)
+
+        ui_name_layout = QHBoxLayout()
+        ui_name_layout.addWidget(QLabel("UI显示名称:"))
+        ui_name_input = QLineEdit()
+        ui_name_layout.addWidget(ui_name_input)
+        layout.addLayout(ui_name_layout)
+
+        web_name_layout = QHBoxLayout()
+        web_name_layout.addWidget(QLabel("Web内部名称:"))
+        web_name_input = QLineEdit()
+        web_name_layout.addWidget(web_name_input)
+        layout.addLayout(web_name_layout)
+
+        priority_layout = QHBoxLayout()
+        priority_layout.addWidget(QLabel("优先级:"))
+        priority_spin = QSpinBox()
+        priority_spin.setRange(1, 100)
+        priority_spin.setValue(1)
+        priority_layout.addWidget(priority_spin)
+        layout.addLayout(priority_layout)
+
+        btn_layout = QHBoxLayout()
+        ok_btn = QPushButton("确定")
+        ok_btn.clicked.connect(dialog.accept)
+        btn_layout.addWidget(ok_btn)
+
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        layout.addLayout(btn_layout)
+
+        if dialog.exec_() == QDialog.Accepted:
+            ui_name = ui_name_input.text().strip()
+            web_name = web_name_input.text().strip()
+
+            if ui_name and web_name:
+                new_model = {
+                    'ui_name': ui_name,
+                    'web_name': web_name,
+                    'priority': priority_spin.value(),
+                    'enabled': True
+                }
+                self.models.append(new_model)
+                self.load_models()
+
+    def delete_model(self):
+        """删除模型"""
+        current_row = self.table.currentRow()
+        if current_row >= 0:
+            del self.models[current_row]
+            self.load_models()
+
+    def get_models(self):
+        """获取模型列表"""
+        models = []
+        for i in range(self.table.rowCount()):
+            ui_name = self.table.item(i, 0).text()
+            web_name = self.table.item(i, 1).text()
+            priority = int(self.table.item(i, 2).text())
+            enabled_check = self.table.cellWidget(i, 3)
+            enabled = enabled_check.isChecked()
+
+            models.append({
+                'ui_name': ui_name,
+                'web_name': web_name,
+                'priority': priority,
+                'enabled': enabled
+            })
+
+        return models
+
+
+
+class MainWindow(QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+        self.config = {}
+        self.cookie_manager = None
+        self.task_thread = None
+        self.login_thread = None
+        self.login_dialog = None
+        self.log_buffer = []
+        self.stats_data = {
+            'success': 0,
+            'failed': 0
+        }
+
+        # 活动会话相关
+        self.active_browser = None
+        self.active_context = None
+        self.active_page = None
+        self.active_playwright = None
+        self.active_account_name = None
+
+        self.load_config()
+        self.cookie_manager = StorageManager()
+        self.init_ui()
+
+    def get_default_config(self):
+        """获取默认配置"""
+        return {
+            'website_url': 'https://ai.achuanai.cn',
+            'output_dir': './output',
+            'log_dir': './logs',
+            'default_model': 'GPT-4',
+            'system_prompt': '你是一个专业的内容创作助手',
+            'use_new_conversation': True,
+            'settings': {
+                'interval': 3,
+                'timeout': 120,
+                'retry': 3,
+                'skip_generated': True,
+                'show_browser': False
+            },
+            'web_elements': {
+                'input': 'textarea',
+                'send_button': 'button[type="submit"]',
+                'model_button': '.model-selector',
+                'menu': '.model-menu'
+            },
+            'models': [
+                {
+                    'ui_name': 'GPT-4',
+                    'web_name': 'gpt-4',
+                    'priority': 1,
+                    'enabled': True
+                },
+                {
+                    'ui_name': 'GPT-3.5',
+                    'web_name': 'gpt-3.5-turbo',
+                    'priority': 2,
+                    'enabled': True
+                },
+                {
+                    'ui_name': 'Claude',
+                    'web_name': 'claude-3',
+                    'priority': 3,
+                    'enabled': True
+                }
+            ],
+            'word_format': {
+                'font': '宋体',
+                'font_size': 12,
+                'line_space': '1.5倍行距',
+                'add_cover': True,
+                'add_toc': True
+            },
+            'filter_keywords': [],
+            'filter_regex': [],
+            'logging': {
+                'save_to_file': True,
+                'level': 'INFO'
+            }
+        }
+
+    def load_config(self):
+        """加载配置"""
+        config_file = Path('config/config.json')
+
+        if config_file.exists():
+            try:
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    self.config = json.load(f)
+                print("✓ 配置已加载")
+            except Exception as e:
+                print(f"⚠️  配置加载失败: {e}")
+                self.config = self.get_default_config()
+        else:
+            self.config = self.get_default_config()
+            self.save_config()
+
+    def save_config(self):
+        """保存配置"""
+        try:
+            config_file = Path('config/config.json')
+            config_file.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(config_file, 'w', encoding='utf-8') as f:
+                json.dump(self.config, f, ensure_ascii=False, indent=2)
+
+            return True
+        except Exception as e:
+            print(f"保存配置失败: {e}")
+            return False
+
+    def init_ui(self):
+        """初始化UI"""
+        self.setWindowTitle("AI文档批量生成工具 v2.0")
+        self.setGeometry(100, 100, 1400, 900)
+
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+
+        main_layout = QVBoxLayout(central_widget)
+
+        # 顶部工具栏
+        toolbar_layout = QHBoxLayout()
+
+        # 账号管理区域
+        account_group = QGroupBox("账号管理")
+        account_layout = QHBoxLayout(account_group)
+
+        account_layout.addWidget(QLabel("当前账号:"))
+
+        self.account_combo = QComboBox()
+        self.account_combo.currentTextChanged.connect(self.on_account_changed)
+        account_layout.addWidget(self.account_combo)
+
+        self.cookie_status_label = QLabel("状态: 未登录")
+        account_layout.addWidget(self.cookie_status_label)
+
+        manual_login_btn = QPushButton("手动登录")
+        manual_login_btn.clicked.connect(self.manual_login)
+        account_layout.addWidget(manual_login_btn)
+
+        delete_account_btn = QPushButton("删除账号")
+        delete_account_btn.clicked.connect(self.delete_account)
+        account_layout.addWidget(delete_account_btn)
+
+        export_account_btn = QPushButton("导出账号")
+        export_account_btn.clicked.connect(self.export_account)
+        account_layout.addWidget(export_account_btn)
+
+        copy_cookies_btn = QPushButton("复制Cookie")
+        copy_cookies_btn.clicked.connect(self.copy_cookies)
+        account_layout.addWidget(copy_cookies_btn)
+
+        toolbar_layout.addWidget(account_group)
+
+        main_layout.addLayout(toolbar_layout)
+
+        # 标签页
+        self.tab_widget = QTabWidget()
+
+        # 主界面
+        self.create_main_tab()
+
+        # 账号管理
+        self.create_account_tab()
+
+        # 设置
+        self.create_settings_tab()
+
+        # 统计
+        self.create_stats_tab()
+
+        # 过滤规则
+        self.create_filter_tab()
+
+        # 运行日志
+        self.create_log_tab()
+
+        main_layout.addWidget(self.tab_widget)
+
+        # 底部状态栏
+        status_layout = QHBoxLayout()
+
+        self.status_label = QLabel("就绪")
+        status_layout.addWidget(self.status_label)
+
+        self.progress_bar = QProgressBar()
+        status_layout.addWidget(self.progress_bar)
+
+        main_layout.addLayout(status_layout)
+
+        # 加载账号列表
+        self.update_account_combo()
+
+        # 输出缓存的日志
+        for log_line in self.log_buffer:
+            self.log_text.append(log_line)
+        self.log_buffer.clear()
+
+    def create_main_tab(self):
+        """创建主界面标签页"""
+        main_tab = QWidget()
+        layout = QVBoxLayout(main_tab)
+
+        # 标题输入区
+        title_group = QGroupBox("标题输入")
+        title_layout = QVBoxLayout(title_group)
+
+        btn_layout = QHBoxLayout()
+
+        import_btn = QPushButton("从文件导入")
+        import_btn.clicked.connect(self.import_titles)
+        btn_layout.addWidget(import_btn)
+
+        batch_btn = QPushButton("批量生成标题")
+        batch_btn.clicked.connect(self.batch_input_titles)
+        btn_layout.addWidget(batch_btn)
+
+        btn_layout.addStretch()
+
+        title_layout.addLayout(btn_layout)
+
+        self.title_input = QTextEdit()
+        self.title_input.setPlaceholderText("每行一个标题，例如：\n如何学习Python\n人工智能的发展历史\n...")
+        title_layout.addWidget(self.title_input)
+
+        layout.addWidget(title_group)
+
+        # 生成设置
+        settings_group = QGroupBox("生成设置")
+        settings_layout = QVBoxLayout(settings_group)
+
+        model_layout = QHBoxLayout()
+        model_layout.addWidget(QLabel("选择模型:"))
+
+        self.model_combo = QComboBox()
+        self.reload_model_list()
+        model_layout.addWidget(self.model_combo)
+
+        manage_model_btn = QPushButton("管理模型")
+        manage_model_btn.clicked.connect(self.open_model_manager)
+        model_layout.addWidget(manage_model_btn)
+
+        model_layout.addStretch()
+        settings_layout.addLayout(model_layout)
+
+        output_layout = QHBoxLayout()
+        output_layout.addWidget(QLabel("输出目录:"))
+
+        self.output_dir_input = QLineEdit()
+        self.output_dir_input.setText(self.config.get('output_dir', './output'))
+        output_layout.addWidget(self.output_dir_input)
+
+        browse_btn = QPushButton("浏览")
+        browse_btn.clicked.connect(self.browse_output_dir)
+        output_layout.addWidget(browse_btn)
+
+        settings_layout.addLayout(output_layout)
+
+        layout.addWidget(settings_group)
+
+        # 控制按钮
+        control_layout = QHBoxLayout()
+
+        self.start_btn = QPushButton("开始生成")
+        self.start_btn.setStyleSheet("font-size: 16px; padding: 10px;")
+        self.start_btn.clicked.connect(self.start_task)
+        control_layout.addWidget(self.start_btn)
+
+        self.pause_btn = QPushButton("暂停")
+        self.pause_btn.setEnabled(False)
+        control_layout.addWidget(self.pause_btn)
+
+        self.stop_btn = QPushButton("停止")
+        self.stop_btn.setEnabled(False)
+        control_layout.addWidget(self.stop_btn)
+
+        layout.addLayout(control_layout)
+
+        self.tab_widget.addTab(main_tab, "主界面")
+
+    def create_account_tab(self):
+        """创建账号管理标签页"""
+        account_tab = QWidget()
+        layout = QVBoxLayout(account_tab)
+
+        info_group = QGroupBox("账号信息")
+        info_layout = QVBoxLayout(info_group)
+
+        self.cookie_text = QTextEdit()
+        self.cookie_text.setReadOnly(True)
+        info_layout.addWidget(self.cookie_text)
+
+        layout.addWidget(info_group)
+
+        self.tab_widget.addTab(account_tab, "账号管理")
+
+    def create_settings_tab(self):
+        """创建设置标签页"""
+        settings_tab = QWidget()
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll_widget = QWidget()
+        layout = QVBoxLayout(scroll_widget)
+
+        # 基本设置
+        basic_group = QGroupBox("基本设置")
+        basic_layout = QVBoxLayout(basic_group)
+
+        interval_layout = QHBoxLayout()
+        interval_layout.addWidget(QLabel("请求间隔(秒):"))
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(1, 60)
+        self.interval_spin.setValue(self.config['settings']['interval'])
+        interval_layout.addWidget(self.interval_spin)
+        interval_layout.addStretch()
+        basic_layout.addLayout(interval_layout)
+
+        timeout_layout = QHBoxLayout()
+        timeout_layout.addWidget(QLabel("超时时间(秒):"))
+        self.timeout_spin = QSpinBox()
+        self.timeout_spin.setRange(30, 300)
+        self.timeout_spin.setValue(self.config['settings']['timeout'])
+        timeout_layout.addWidget(self.timeout_spin)
+        timeout_layout.addStretch()
+        basic_layout.addLayout(timeout_layout)
+
+        retry_layout = QHBoxLayout()
+        retry_layout.addWidget(QLabel("重试次数:"))
+        self.retry_spin = QSpinBox()
+        self.retry_spin.setRange(1, 10)
+        self.retry_spin.setValue(self.config['settings']['retry'])
+        retry_layout.addWidget(self.retry_spin)
+        retry_layout.addStretch()
+        basic_layout.addLayout(retry_layout)
+
+        self.skip_generated_check = QCheckBox("跳过已生成的文件")
+        self.skip_generated_check.setChecked(self.config['settings']['skip_generated'])
+        basic_layout.addWidget(self.skip_generated_check)
+
+        self.show_browser_check = QCheckBox("显示浏览器窗口")
+        self.show_browser_check.setChecked(self.config['settings']['show_browser'])
+        basic_layout.addWidget(self.show_browser_check)
+
+        layout.addWidget(basic_group)
+
+        # AI设置
+        ai_group = QGroupBox("AI设置")
+        ai_layout = QVBoxLayout(ai_group)
+
+        ai_layout.addWidget(QLabel("系统提示词:"))
+        self.system_prompt_text = QTextEdit()
+        self.system_prompt_text.setPlainText(self.config.get('system_prompt', ''))
+        self.system_prompt_text.setMaximumHeight(100)
+        ai_layout.addWidget(self.system_prompt_text)
+
+        self.new_conversation_check = QCheckBox("每个标题使用新对话")
+        self.new_conversation_check.setChecked(self.config.get('use_new_conversation', True))
+        ai_layout.addWidget(self.new_conversation_check)
+
+        layout.addWidget(ai_group)
+
+        # Word格式设置
+        word_group = QGroupBox("Word格式设置")
+        word_layout = QVBoxLayout(word_group)
+
+        font_layout = QHBoxLayout()
+        font_layout.addWidget(QLabel("字体:"))
+        self.font_combo = QComboBox()
+        self.font_combo.addItems(['宋体', '黑体', '微软雅黑', 'Arial', 'Times New Roman'])
+        self.font_combo.setCurrentText(self.config['word_format']['font'])
+        font_layout.addWidget(self.font_combo)
+        font_layout.addStretch()
+        word_layout.addLayout(font_layout)
+
+        font_size_layout = QHBoxLayout()
+        font_size_layout.addWidget(QLabel("字号:"))
+        self.font_size_spin = QSpinBox()
+        self.font_size_spin.setRange(8, 72)
+        self.font_size_spin.setValue(self.config['word_format']['font_size'])
+        font_size_layout.addWidget(self.font_size_spin)
+        font_size_layout.addStretch()
+        word_layout.addLayout(font_size_layout)
+
+        line_space_layout = QHBoxLayout()
+        line_space_layout.addWidget(QLabel("行距:"))
+        self.line_space_combo = QComboBox()
+        self.line_space_combo.addItems(['单倍行距', '1.5倍行距', '2倍行距'])
+        self.line_space_combo.setCurrentText(self.config['word_format']['line_space'])
+        line_space_layout.addWidget(self.line_space_combo)
+        line_space_layout.addStretch()
+        word_layout.addLayout(line_space_layout)
+
+        self.add_cover_check = QCheckBox("添加封面")
+        self.add_cover_check.setChecked(self.config['word_format']['add_cover'])
+        word_layout.addWidget(self.add_cover_check)
+
+        self.add_toc_check = QCheckBox("添加目录")
+        self.add_toc_check.setChecked(self.config['word_format']['add_toc'])
+        word_layout.addWidget(self.add_toc_check)
+
+        layout.addWidget(word_group)
+
+        # 按钮
+        btn_layout = QHBoxLayout()
+
+        save_btn = QPushButton("保存设置")
+        save_btn.clicked.connect(self.save_config_from_ui)
+        btn_layout.addWidget(save_btn)
+
+        reset_btn = QPushButton("恢复默认")
+        reset_btn.clicked.connect(self.reset_config)
+        btn_layout.addWidget(reset_btn)
+
+        btn_layout.addStretch()
+
+        layout.addLayout(btn_layout)
+
+        scroll.setWidget(scroll_widget)
+
+        tab_layout = QVBoxLayout(settings_tab)
+        tab_layout.addWidget(scroll)
+
+        self.tab_widget.addTab(settings_tab, "设置")
+
+    def create_stats_tab(self):
+        """创建统计标签页"""
+        stats_tab = QWidget()
+        layout = QVBoxLayout(stats_tab)
+
+        # 统计信息
+        stats_group = QGroupBox("统计信息")
+        stats_layout = QVBoxLayout(stats_group)
+
+        refresh_btn = QPushButton("刷新统计")
+        refresh_btn.clicked.connect(self.refresh_stats)
+        stats_layout.addWidget(refresh_btn)
+
+        self.stats_text = QTextEdit()
+        self.stats_text.setReadOnly(True)
+        stats_layout.addWidget(self.stats_text)
+
+        layout.addWidget(stats_group)
+
+        # 文件列表
+        file_group = QGroupBox("生成的文件")
+        file_layout = QVBoxLayout(file_group)
+
+        file_btn_layout = QHBoxLayout()
+
+        refresh_file_btn = QPushButton("刷新列表")
+        refresh_file_btn.clicked.connect(self.refresh_file_list)
+        file_btn_layout.addWidget(refresh_file_btn)
+
+        delete_file_btn = QPushButton("删除选中")
+        delete_file_btn.clicked.connect(self.delete_selected_file)
+        file_btn_layout.addWidget(delete_file_btn)
+
+        open_folder_btn = QPushButton("打开输出目录")
+        open_folder_btn.clicked.connect(self.open_output_folder)
+        file_btn_layout.addWidget(open_folder_btn)
+
+        file_btn_layout.addStretch()
+
+        file_layout.addLayout(file_btn_layout)
+
+        self.file_list = QListWidget()
+        self.file_list.itemDoubleClicked.connect(self.open_file)
+        file_layout.addWidget(self.file_list)
+
+        layout.addWidget(file_group)
+
+        self.tab_widget.addTab(stats_tab, "统计")
+
+    def create_filter_tab(self):
+        """创建过滤规则标签页"""
+        filter_tab = QWidget()
+        layout = QVBoxLayout(filter_tab)
+
+        # 关键词过滤
+        keyword_group = QGroupBox("关键词过滤")
+        keyword_layout = QVBoxLayout(keyword_group)
+
+        keyword_layout.addWidget(QLabel("每行一个关键词，包含这些关键词的内容将被过滤:"))
+
+        self.filter_keywords_text = QTextEdit()
+        keywords = self.config.get('filter_keywords', [])
+        self.filter_keywords_text.setPlainText('\n'.join(keywords))
+        keyword_layout.addWidget(self.filter_keywords_text)
+
+        layout.addWidget(keyword_group)
+
+        # 正则过滤
+        regex_group = QGroupBox("正则表达式过滤")
+        regex_layout = QVBoxLayout(regex_group)
+
+        regex_layout.addWidget(QLabel("每行一个正则表达式:"))
+
+        self.filter_regex_text = QTextEdit()
+        regex = self.config.get('filter_regex', [])
+        self.filter_regex_text.setPlainText('\n'.join(regex))
+        regex_layout.addWidget(self.filter_regex_text)
+
+        layout.addWidget(regex_group)
+
+        # 测试区
+        test_group = QGroupBox("测试过滤规则")
+        test_layout = QVBoxLayout(test_group)
+
+        test_layout.addWidget(QLabel("输入测试内容:"))
+
+        self.test_content = QTextEdit()
+        self.test_content.setMaximumHeight(100)
+        test_layout.addWidget(self.test_content)
+
+        test_btn = QPushButton("测试")
+        test_btn.clicked.connect(self.test_filter)
+        test_layout.addWidget(test_btn)
+
+        self.test_result = QLabel("测试结果将显示在这里")
+        test_layout.addWidget(self.test_result)
+
+        layout.addWidget(test_group)
+
+        # 按钮
+        btn_layout = QHBoxLayout()
+
+        save_filter_btn = QPushButton("保存过滤规则")
+        save_filter_btn.clicked.connect(self.save_filter_rules)
+        btn_layout.addWidget(save_filter_btn)
+
+        btn_layout.addStretch()
+
+        layout.addLayout(btn_layout)
+
+        self.tab_widget.addTab(filter_tab, "过滤规则")
+
+    def create_log_tab(self):
+        """创建日志标签页"""
+        log_tab = QWidget()
+        layout = QVBoxLayout(log_tab)
+
+        btn_layout = QHBoxLayout()
+
+        clear_log_btn = QPushButton("清空日志")
+        clear_log_btn.clicked.connect(lambda: self.log_text.clear())
+        btn_layout.addWidget(clear_log_btn)
+
+        export_log_btn = QPushButton("导出日志")
+        export_log_btn.clicked.connect(self.export_log)
+        btn_layout.addWidget(export_log_btn)
+
+        btn_layout.addStretch()
+
+        layout.addLayout(btn_layout)
+
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        layout.addWidget(self.log_text)
+
+        self.tab_widget.addTab(log_tab, "运行日志")
+
+    def reload_model_list(self):
+        """重新加载模型列表"""
+        self.model_combo.clear()
+
+        enabled_models = [
+            m for m in self.config.get('models', [])
+            if m.get('enabled', True)
+        ]
+
+        enabled_models.sort(key=lambda x: x.get('priority', 999))
+
+        for model in enabled_models:
+            self.model_combo.addItem(model['ui_name'])
+
+        default_model = self.config.get('default_model', '')
+        if default_model:
+            index = self.model_combo.findText(default_model)
+            if index >= 0:
+                self.model_combo.setCurrentIndex(index)
+
+
+    def update_account_combo(self):
+            self.account_combo.addItems(accounts)
+
+            current = self.cookie_manager.current_account
+            if current and current in accounts:
+                self.account_combo.setCurrentText(current)
+            else:
+                self.cookie_manager.current_account = accounts[0]
+                self.account_combo.setCurrentIndex(0)
+
+            self.update_cookie_display()
+        else:
+            self.cookie_status_label.setText("状态: ❌ 无账号")
+            self.cookie_text.setText("请先登录账号")
+
+    def on_account_changed(self, account_name):
+        """账号切换事件"""
+        if account_name:
+            self.cookie_manager.current_account = account_name
+            self.update_cookie_display()
+
+    def update_cookie_display(self):
+        """更新Cookie显示"""
+        account_name = self.account_combo.currentText()
+
+        if not account_name:
+            return
+
+        storage_data = self.cookie_manager.load_account(account_name)
+
+        if storage_data:
+            cookies = storage_data.get('cookies', [])
+            local_storage = storage_data.get('localStorage', [])
+            session_storage = storage_data.get('sessionStorage', [])
+
+            self.cookie_status_label.setText("状态: ✅ 已保存")
+            self.cookie_status_label.setStyleSheet("color: green; font-weight: bold; font-size: 12px;")
+
+            info = f"账号: {account_name}\n"
+            info += f"=" * 40 + "\n\n"
+            info += f"Cookie: {len(cookies)} 个\n"
+            info += f"localStorage: {len(local_storage)} 项\n"
+            info += f"sessionStorage: {len(session_storage)} 项\n"
+
+            self.cookie_text.setText(info)
+        else:
+            self.cookie_status_label.setText("状态: ❌ 数据丢失")
+            self.cookie_text.setText("账号数据已损坏")
+
+    def manual_login(self):
+        """手动登录"""
+        account_name, ok = QInputDialog.getText(
+            self,
+            "手动登录",
+            "请输入会话名称:",
+            text=f"会话_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+
+        if not ok or not account_name.strip():
+            return
+
+        account_name = account_name.strip()
+        self.pending_account_name = account_name
+
+        self.add_log("INFO", f"开始手动登录会话: {account_name}")
+
+        self.login_dialog = QDialog(self)
+        self.login_dialog.setWindowTitle("手动登录")
+        self.login_dialog.setGeometry(300, 300, 400, 150)
+
+        layout = QVBoxLayout(self.login_dialog)
+
+        label = QLabel("浏览器将打开，请手动完成登录操作\n登录成功后点击下方【确认登录】按钮")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        self.login_status_label = QLabel("状态: 正在启动浏览器...")
+        layout.addWidget(self.login_status_label)
+
+        btn_layout = QHBoxLayout()
+
+        confirm_btn = QPushButton("确认登录")
+        confirm_btn.setEnabled(False)
+        confirm_btn.clicked.connect(self.confirm_login)
+        btn_layout.addWidget(confirm_btn)
+
+        self.login_confirm_btn = confirm_btn
+
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.cancel_login)
+        btn_layout.addWidget(cancel_btn)
+
+        layout.addLayout(btn_layout)
+
+        website_url = self.config.get('website_url', 'https://ai.achuanai.cn')
+
+        self.login_thread = ManualLoginThread(website_url)
+        self.login_thread.ready.connect(self.on_login_ready)
+        self.login_thread.finished.connect(self.on_login_finished)
+        self.login_thread.error.connect(self.on_login_error)
+
+        self.login_thread.start()
+
+        self.login_dialog.exec_()
+
+    def on_login_ready(self):
+        """登录准备就绪"""
+        if self.login_dialog:
+            self.login_status_label.setText("状态: ✅ 浏览器已打开，请在浏览器中登录")
+            self.login_confirm_btn.setEnabled(True)
+
+    def confirm_login(self):
+        """确认登录"""
+        if self.login_thread:
+            self.login_thread.confirm_login()
+            self.login_status_label.setText("状态: 正在保存登录状态...")
+            self.login_confirm_btn.setEnabled(False)
+
+    def cancel_login(self):
+        """取消登录"""
+        if self.login_thread:
+            self.login_thread.quit()
+            self.login_thread.wait()
+
+        if self.login_dialog:
+            self.login_dialog.close()
+            self.login_dialog = None
+
+        self.add_log("WARNING", "登录已取消")
+
+    def on_login_error(self, error_msg):
+        """登录错误"""
+        self.add_log("ERROR", error_msg)
+
+        if self.login_dialog:
+            self.login_status_label.setText(f"状态: ❌ {error_msg[:50]}")
+
+    def on_login_finished(self, success, message, cookies):
+        """登录完成回调（保持会话模式）"""
+        if self.login_dialog:
+            self.login_dialog.close()
+            self.login_dialog = None
+
+        if success:
+            self.add_log("SUCCESS", message)
+
+            account_name = getattr(self, 'pending_account_name', f'会话_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
+
+            if hasattr(self.login_thread, 'browser') and self.login_thread.browser:
+                self.active_browser = self.login_thread.browser
+                self.active_context = self.login_thread.context
+                self.active_page = self.login_thread.page
+                self.active_playwright = getattr(self.login_thread, 'playwright', None)
+                self.active_account_name = account_name
+
+                self.add_log("SUCCESS", f"会话 '{account_name}' 已激活（浏览器保持打开）")
+
+                self.cookie_status_label.setText("状态: 🟢 会话活动中")
+                self.cookie_status_label.setStyleSheet("color: green; font-weight: bold; font-size: 12px;")
+
+                info = f"会话: {account_name}\n"
+                info += f"=" * 40 + "\n\n"
+                info += f"🌐 模式: 保持浏览器会话\n"
+                info += f"📅 登录时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                info += f"⚠️  注意：\n"
+                info += f"  • 浏览器将保持打开\n"
+                info += f"  • 请勿手动关闭浏览器\n"
+                info += f"  • 任务执行时使用此会话\n"
+                info += f"  • 程序退出时会自动关闭浏览器\n"
+
+                self.cookie_text.setText(info)
+
+                QMessageBox.information(
+                    self,
+                    "登录成功",
+                    f"✅ 登录成功！\n\n"
+                    f"会话名称: {account_name}\n"
+                    f"模式: 保持浏览器会话\n\n"
+                    f"⚠️  请保持浏览器窗口打开！\n"
+                    f"关闭浏览器将导致会话失效。"
+                )
+            else:
+                self.add_log("ERROR", "浏览器会话丢失")
+                QMessageBox.critical(self, "错误", "浏览器会话丢失")
+        else:
+            self.add_log("ERROR", f"登录失败: {message}")
+            QMessageBox.warning(self, "登录失败", f"登录失败:\n\n{message}")
+
+        if hasattr(self, 'pending_account_name'):
+            delattr(self, 'pending_account_name')
+
+    def delete_account(self):
+        """删除账号"""
+        account_name = self.account_combo.currentText()
+
+        if not account_name:
+            QMessageBox.warning(self, "提示", "请先选择要删除的账号")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "确认删除",
+            f"确定要删除账号 '{account_name}' 吗？\n此操作不可恢复！",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            if self.cookie_manager.delete_account(account_name):
+                self.add_log("SUCCESS", f"账号 '{account_name}' 已删除")
+                self.update_account_combo()
+            else:
+                self.add_log("ERROR", f"删除账号 '{account_name}' 失败")
+
+    def export_account(self):
+        """导出账号"""
+        account_name = self.account_combo.currentText()
+
+        if not account_name:
+            QMessageBox.warning(self, "提示", "请先选择要导出的账号")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出账号",
+            f"{account_name}.json",
+            "JSON文件 (*.json)"
+        )
+
+        if file_path:
+            storage_data = self.cookie_manager.load_account(account_name)
+
+            if storage_data:
+                try:
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        json.dump(storage_data, f, ensure_ascii=False, indent=2)
+
+                    self.add_log("SUCCESS", f"账号已导出到: {file_path}")
+                    QMessageBox.information(self, "成功", f"账号已导出到:\n{file_path}")
+                except Exception as e:
+                    self.add_log("ERROR", f"导出失败: {e}")
+            else:
+                QMessageBox.warning(self, "错误", "账号数据不存在")
+
+    def copy_cookies(self):
+        """复制Cookie到剪贴板"""
+        account_name = self.account_combo.currentText()
+
+        if not account_name:
+            QMessageBox.warning(self, "提示", "请先选择账号")
+            return
+
+        storage_data = self.cookie_manager.load_account(account_name)
+
+        if storage_data:
+            cookies = storage_data.get('cookies', [])
+
+            if cookies:
+                cookie_json = json.dumps(cookies, ensure_ascii=False, indent=2)
+
+                clipboard = QApplication.clipboard()
+                clipboard.setText(cookie_json)
+
+                self.add_log("SUCCESS", f"已复制 {len(cookies)} 个Cookie到剪贴板")
+                QMessageBox.information(self, "成功", f"已复制 {len(cookies)} 个Cookie到剪贴板")
+            else:
+                QMessageBox.warning(self, "提示", "该账号没有Cookie")
+        else:
+            QMessageBox.warning(self, "错误", "账号数据不存在")
+
+    def start_task(self):
+        """开始任务（使用活动会话）"""
+        titles_text = self.title_input.toPlainText().strip()
+
+        if not titles_text:
+            QMessageBox.warning(self, "提示", "请输入至少一个标题")
+            return
+
+        titles = [t.strip() for t in titles_text.split('\n') if t.strip()]
+
+        if not titles:
+            QMessageBox.warning(self, "提示", "没有有效的标题")
+            return
+
+        active_page = getattr(self, 'active_page', None)
+
+        if not active_page:
+            account_name = self.account_combo.currentText()
+            if not account_name:
+                QMessageBox.warning(
+                    self,
+                    "提示",
+                    "请先登录账号\n\n"
+                    "点击【账号管理】→【手动登录】"
+                )
+                return
+        else:
+            self.add_log("INFO", f"使用活动会话: {getattr(self, 'active_account_name', '未命名')}")
+
+        self.save_config_from_ui()
+
+        model_name = self.model_combo.currentText()
+        output_dir = self.output_dir_input.text()
+
+        self.task_thread = TaskThread(
+            self.config,
+            self.cookie_manager,
+            titles,
+            model_name,
+            output_dir,
+            active_page=active_page
+        )
+
+        self.task_thread.log_signal.connect(self.add_log)
+        self.task_thread.progress_signal.connect(self.update_progress)
+        self.task_thread.finished_signal.connect(self.on_task_finished)
+
+        self.start_btn.setEnabled(False)
+        self.pause_btn.setEnabled(True)
+        self.stop_btn.setEnabled(True)
+
+        self.progress_bar.setValue(0)
+        self.progress_bar.setMaximum(len(titles))
+
+        self.add_log("SUCCESS", f"任务已启动，共 {len(titles)} 个标题")
+        self.task_thread.start()
+
+    def update_progress(self, current, total, result):
+        """更新进度"""
+        self.progress_bar.setValue(current)
+
+        if result.get('success'):
+            self.stats_data['success'] += 1
+        else:
+            self.stats_data['failed'] += 1
+
+        self.status_label.setText(f"进度: {current}/{total}")
+
+    def on_task_finished(self, result):
+        """任务完成"""
+        self.start_btn.setEnabled(True)
+        self.pause_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+
+        if result.get('success'):
+            self.add_log("SUCCESS", "✅ 所有任务已完成！")
+
+            QMessageBox.information(
+                self,
+                "完成",
+                f"任务已完成！\n\n"
+                f"成功: {self.stats_data['success']}\n"
+                f"失败: {self.stats_data['failed']}"
+            )
+        else:
+            error = result.get('error', '未知错误')
+            self.add_log("ERROR", f"任务失败: {error}")
+
+            QMessageBox.critical(
+                self,
+                "失败",
+                f"任务执行失败:\n\n{error}"
+            )
+
+        self.refresh_stats()
+        self.refresh_file_list()
+
+    def import_titles(self):
+        """从文件导入标题"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "导入标题",
+            "",
+            "文本文件 (*.txt);;所有文件 (*.*)"
+        )
+
+        if file_path:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+
+                self.title_input.setPlainText(content)
+
+                lines = [l.strip() for l in content.split('\n') if l.strip()]
+                self.add_log("SUCCESS", f"已导入 {len(lines)} 个标题")
+            except Exception as e:
+                self.add_log("ERROR", f"导入失败: {e}")
+
+    def batch_input_titles(self):
+        """批量生成标题"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("批量生成标题")
+        dialog.setGeometry(300, 300, 500, 300)
+
+        layout = QVBoxLayout(dialog)
+
+        layout.addWidget(QLabel("输入基础标题和数量，将自动添加序号:"))
+
+        base_layout = QHBoxLayout()
+        base_layout.addWidget(QLabel("基础标题:"))
+        base_input = QLineEdit()
+        base_input.setPlaceholderText("例如: 如何学习编程")
+        base_layout.addWidget(base_input)
+        layout.addLayout(base_layout)
+
+        count_layout = QHBoxLayout()
+        count_layout.addWidget(QLabel("生成数量:"))
+        count_spin = QSpinBox()
+        count_spin.setRange(1, 1000)
+        count_spin.setValue(10)
+        count_layout.addWidget(count_spin)
+        layout.addLayout(count_layout)
+
+        btn_layout = QHBoxLayout()
+
+        ok_btn = QPushButton("生成")
+        ok_btn.clicked.connect(dialog.accept)
+        btn_layout.addWidget(ok_btn)
+
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        layout.addLayout(btn_layout)
+
+        if dialog.exec_() == QDialog.Accepted:
+            base_title = base_input.text().strip()
+            count = count_spin.value()
+
+            if base_title:
+                titles = [f"{base_title} {i+1}" for i in range(count)]
+
+                current = self.title_input.toPlainText().strip()
+                if current:
+                    current += "\n"
+
+                self.title_input.setPlainText(current + "\n".join(titles))
+
+                self.add_log("SUCCESS", f"已生成 {count} 个标题")
+
+    def browse_output_dir(self):
+        """浏览输出目录"""
+        dir_path = QFileDialog.getExistingDirectory(
+            self,
+            "选择输出目录",
+            self.output_dir_input.text()
+        )
+
+        if dir_path:
+            self.output_dir_input.setText(dir_path)
+
+    def open_model_manager(self):
+        """打开模型管理器"""
+        dialog = ModelManagerDialog(self.config, self)
+
+        if dialog.exec_() == QDialog.Accepted:
+            self.config['models'] = dialog.get_models()
+            self.save_config()
+            self.reload_model_list()
+
+            self.add_log("SUCCESS", "模型配置已更新")
+
+    def save_config_from_ui(self):
+        """从UI保存配置"""
+        self.config['settings']['interval'] = self.interval_spin.value()
+        self.config['settings']['timeout'] = self.timeout_spin.value()
+        self.config['settings']['retry'] = self.retry_spin.value()
+        self.config['settings']['skip_generated'] = self.skip_generated_check.isChecked()
+        self.config['settings']['show_browser'] = self.show_browser_check.isChecked()
+
+        self.config['system_prompt'] = self.system_prompt_text.toPlainText()
+        self.config['use_new_conversation'] = self.new_conversation_check.isChecked()
+
+        self.config['word_format']['font'] = self.font_combo.currentText()
+        self.config['word_format']['font_size'] = self.font_size_spin.value()
+        self.config['word_format']['line_space'] = self.line_space_combo.currentText()
+        self.config['word_format']['add_cover'] = self.add_cover_check.isChecked()
+        self.config['word_format']['add_toc'] = self.add_toc_check.isChecked()
+
+        self.config['output_dir'] = self.output_dir_input.text()
+        self.config['default_model'] = self.model_combo.currentText()
+
+        if self.save_config():
+            self.add_log("SUCCESS", "配置已保存")
+            QMessageBox.information(self, "成功", "配置已保存")
+
+    def reset_config(self):
+        """恢复默认配置"""
+        reply = QMessageBox.question(
+            self,
+            "确认",
+            "确定要恢复默认配置吗？\n当前配置将被覆盖！",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            self.config = self.get_default_config()
+            self.save_config()
+
+            self.interval_spin.setValue(self.config['settings']['interval'])
+            self.timeout_spin.setValue(self.config['settings']['timeout'])
+            self.retry_spin.setValue(self.config['settings']['retry'])
+            self.skip_generated_check.setChecked(self.config['settings']['skip_generated'])
+            self.show_browser_check.setChecked(self.config['settings']['show_browser'])
+
+            self.system_prompt_text.setPlainText(self.config['system_prompt'])
+            self.new_conversation_check.setChecked(self.config['use_new_conversation'])
+
+            self.font_combo.setCurrentText(self.config['word_format']['font'])
+            self.font_size_spin.setValue(self.config['word_format']['font_size'])
+            self.line_space_combo.setCurrentText(self.config['word_format']['line_space'])
+            self.add_cover_check.setChecked(self.config['word_format']['add_cover'])
+            self.add_toc_check.setChecked(self.config['word_format']['add_toc'])
+
+            self.reload_model_list()
+
+            self.add_log("SUCCESS", "已恢复默认配置")
+
+    def refresh_stats(self):
+        """刷新统计"""
+        output_dir = Path(self.config.get('output_dir', './output'))
+
+        if not output_dir.exists():
+            self.stats_text.setText("输出目录不存在")
+            return
+
+        files = list(output_dir.glob('*.docx'))
+
+        total_size = sum(f.stat().st_size for f in files)
+
+        stats = f"统计信息\n"
+        stats += f"=" * 40 + "\n\n"
+        stats += f"生成文件数: {len(files)}\n"
+        stats += f"总大小: {total_size / 1024 / 1024:.2f} MB\n"
+        stats += f"输出目录: {output_dir}\n\n"
+        stats += f"本次运行:\n"
+        stats += f"  成功: {self.stats_data['success']}\n"
+        stats += f"  失败: {self.stats_data['failed']}\n"
+
+        self.stats_text.setText(stats)
+
+    def refresh_file_list(self):
+        """刷新文件列表"""
+        self.file_list.clear()
+
+        output_dir = Path(self.config.get('output_dir', './output'))
+
+        if output_dir.exists():
+            files = sorted(
+                output_dir.glob('*.docx'),
+                key=lambda x: x.stat().st_mtime,
+                reverse=True
+            )
+
+            for f in files:
+                size = f.stat().st_size / 1024
+                mtime = datetime.fromtimestamp(f.stat().st_mtime)
+
+                item_text = f"{f.name} ({size:.1f} KB) - {mtime.strftime('%Y-%m-%d %H:%M:%S')}"
+                self.file_list.addItem(item_text)
+
+    def delete_selected_file(self):
+        """删除选中的文件"""
+        current_item = self.file_list.currentItem()
+
+        if not current_item:
+            QMessageBox.warning(self, "提示", "请先选择要删除的文件")
+            return
+
+        file_name = current_item.text().split(' (')[0]
+
+        reply = QMessageBox.question(
+            self,
+            "确认删除",
+            f"确定要删除文件 '{file_name}' 吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            output_dir = Path(self.config.get('output_dir', './output'))
+            file_path = output_dir / file_name
+
+            try:
+                file_path.unlink()
+                self.add_log("SUCCESS", f"已删除: {file_name}")
+                self.refresh_file_list()
+            except Exception as e:
+                self.add_log("ERROR", f"删除失败: {e}")
+
+    def open_file(self, item):
+        """打开文件"""
+        file_name = item.text().split(' (')[0]
+        output_dir = Path(self.config.get('output_dir', './output'))
+        file_path = output_dir / file_name
+
+        if file_path.exists():
+            import subprocess
+            subprocess.Popen(['start', '', str(file_path)], shell=True)
+        else:
+            QMessageBox.warning(self, "错误", "文件不存在")
+
+    def open_output_folder(self):
+        """打开输出目录"""
+        output_dir = Path(self.config.get('output_dir', './output'))
+
+        if output_dir.exists():
+            import subprocess
+            subprocess.Popen(['explorer', str(output_dir)])
+        else:
+            QMessageBox.warning(self, "错误", "输出目录不存在")
+
+    def save_filter_rules(self):
+        """保存过滤规则"""
+        keywords = [
+            k.strip() for k in self.filter_keywords_text.toPlainText().split('\n')
+            if k.strip()
+        ]
+
+        regex = [
+            r.strip() for r in self.filter_regex_text.toPlainText().split('\n')
+            if r.strip()
+        ]
+
+        self.config['filter_keywords'] = keywords
+        self.config['filter_regex'] = regex
+
+        if self.save_config():
+            self.add_log("SUCCESS", f"过滤规则已保存 (关键词: {len(keywords)}, 正则: {len(regex)})")
+            QMessageBox.information(self, "成功", "过滤规则已保存")
+
+    def test_filter(self):
+        """测试过滤"""
+        content = self.test_content.toPlainText()
+
+        if not content:
+            self.test_result.setText("请输入测试内容")
+            return
+
+        keywords = self.config.get('filter_keywords', [])
+        regex_patterns = self.config.get('filter_regex', [])
+
+        filtered = False
+        reason = ""
+
+        for keyword in keywords:
+            if keyword in content:
+                filtered = True
+                reason = f"匹配关键词: {keyword}"
+                break
+
+        if not filtered:
+            for pattern in regex_patterns:
+                try:
+                    if re.search(pattern, content):
+                        filtered = True
+                        reason = f"匹配正则: {pattern}"
+                        break
+                except:
+                    pass
+
+        if filtered:
+            self.test_result.setText(f"❌ 将被过滤\n原因: {reason}")
+            self.test_result.setStyleSheet("color: red; font-weight: bold;")
+        else:
+            self.test_result.setText("✅ 不会被过滤")
+            self.test_result.setStyleSheet("color: green; font-weight: bold;")
+
+    def export_log(self):
+        """导出日志"""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出日志",
+            f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            "文本文件 (*.txt)"
+        )
+
+        if file_path:
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(self.log_text.toPlainText())
+
+                self.add_log("SUCCESS", f"日志已导出到: {file_path}")
+                QMessageBox.information(self, "成功", f"日志已导出到:\n{file_path}")
+            except Exception as e:
+                self.add_log("ERROR", f"导出失败: {e}")
+
+    def add_log(self, level, message):
+        """添加日志"""
+        timestamp = datetime.now().strftime('%H:%M:%S')
+
+        level_colors = {
+            'INFO': 'black',
+            'SUCCESS': 'green',
+            'WARNING': 'orange',
+            'ERROR': 'red'
+        }
+
+        level_symbols = {
+            'INFO': 'ℹ️',
+            'SUCCESS': '✅',
+            'WARNING': '⚠️',
+            'ERROR': '❌'
+        }
+
+        color = level_colors.get(level, 'black')
+        symbol = level_symbols.get(level, '')
+
+        log_line = f'<span style="color: gray;">[{timestamp}]</span> '
+        log_line += f'<span style="color: {color}; font-weight: bold;">{symbol} {level}</span>: '
+        log_line += f'<span>{message}</span>'
+
+                if hasattr(self, 'log_text'):
+            self.log_text.append(log_line)
+            self.log_text.moveCursor(QTextCursor.End)
+        else:
+            self.log_buffer.append(log_line)
+
+        print(f"[{timestamp}] {level}: {message}")
+
+    def closeEvent(self, event):
+        """程序关闭时清理资源"""
+        if hasattr(self, 'active_browser') and self.active_browser:
+            reply = QMessageBox.question(
+                self,
+                "确认退出",
+                "当前有活动的浏览器会话\n\n"
+                "退出程序将关闭浏览器\n\n"
+                "确定要退出吗？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+
+            if reply == QMessageBox.No:
+                event.ignore()
+                return
+
+            try:
+                asyncio.run(self._cleanup_browser())
+            except:
+                pass
+
+        event.accept()
+
+    async def _cleanup_browser(self):
+        """清理浏览器资源"""
+        try:
+            if hasattr(self, 'active_browser') and self.active_browser:
+                await self.active_browser.close()
+                self.add_log("INFO", "浏览器已关闭")
+
+            if hasattr(self, 'active_playwright') and self.active_playwright:
+                await self.active_playwright.stop()
+                self.add_log("INFO", "Playwright已停止")
+        except Exception as e:
+            self.add_log("ERROR", f"清理失败: {e}")
