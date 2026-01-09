@@ -11,10 +11,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     LANG=C.UTF-8
 
 # 1. 安装系统依赖
-# 注意：在 GitHub Actions 构建时，千万不要换成国内源（如阿里云），直接用默认源最快最稳
+# 修复：去掉了 aliyun 源（GitHub Actions 在国外访问反而慢），并替换了 Debian 12 的新包名
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb x11vnc fluxbox novnc net-tools \
-    libgl1-mesa-glx libegl1-mesa libxkbcommon-x11-0 libdbus-1-3 \
+    libgl1 libegl1 libxkbcommon-x11-0 libdbus-1-3 \
     libxcb-cursor0 libxcb-xinerama0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
     xclip fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
