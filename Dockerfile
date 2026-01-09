@@ -10,10 +10,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     # 关键：设置语言为中文，避免生成的 Word 或 GUI 乱码
     LANG=C.UTF-8
 
-# 1. 更换国内源并安装系统依赖
-# 新增 xclip (剪贴板支持), fonts-noto-cjk (中文字体), libxcb* (PyQt5依赖)
-RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list && \
-    apt-get update && apt-get install -y --no-install-recommends \
+# 1. 安装系统依赖
+# 注意：在 GitHub Actions 构建时，千万不要换成国内源（如阿里云），直接用默认源最快最稳
+RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb x11vnc fluxbox novnc net-tools \
     libgl1-mesa-glx libegl1-mesa libxkbcommon-x11-0 libdbus-1-3 \
     libxcb-cursor0 libxcb-xinerama0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
