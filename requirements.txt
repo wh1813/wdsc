@@ -1,0 +1,21 @@
+# UI框架
+PyQt5>=5.15.0
+
+# 网页自动化
+playwright>=1.40.0
+
+# Word文档处理
+python-docx>=1.1.0
+
+# 加密
+cryptography>=41.0.0
+
+# 日志
+loguru>=0.7.0
+
+# 数据验证
+pydantic>=2.5.0
+
+# 其他工具
+requests>=2.31.0
+beautifulsoup4>=4.12.0
