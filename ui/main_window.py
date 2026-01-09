@@ -225,6 +225,19 @@ class MainWindow(QMainWindow):
         self.active_session_port = 0
         self.current_task_total_titles = []
         self.load_config(); self.cookie_manager = StorageManager(); self.init_ui()
+        
+        # === 新增：自动加载挂载的题目文件 ===
+        try:
+            # 这里的路径对应下面 Docker 挂载的路径
+            mount_file = "/app/data/1113.txt" 
+            if os.path.exists(mount_file):
+                with open(mount_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    self.title_input.setPlainText(content)
+                    self.add_log("INFO", f"已自动加载题目文件: 1113.txt (共 {len(content.splitlines())} 行)")
+        except Exception as e:
+            self.add_log("ERROR", f"自动加载题目文件失败: {e}")
+        # ================================
     
     def get_default_config(self):
         return {
